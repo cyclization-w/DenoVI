@@ -1,0 +1,2 @@
+# this is the full module of DenoVI experimental version
+# DenoVI uses scVI and Pyro structure for inference and modeling of image-based spatial transcriptomics(Xenium, MerFISH, ...) 
