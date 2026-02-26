@@ -34,3 +34,156 @@ from pyro.distributions import (
 )
 from torch.distributions import kl_divergence as kl
 from typing import Literal, Callable, Iterable
+
+class denoVIModel(PyroModule):
+    def __init__(
+        self,
+        n_input: int,
+        n_obs: int,
+        n_neighbors: int,
+        z_encoder, # 类型标注根据你实际的 Encoder 类定
+        expression_anntorchdata,
+        spatial_radius: float = 30.0,
+        spatial_scale: float = 10.0,
+        n_batch: int = 0,
+        n_hidden: int = 32,
+        n_latent: int = 10,
+        mixture_k: int = 100, 
+        dispersion_penalty: float = 1.0,
+        prior_a_scale: float = 1.0,
+        n_layers: int = 2,
+        n_cats_per_cov: Iterable[int] | None = None,
+        dispersion: Literal["gene", "gene-batch"] = "gene",
+        gene_likelihood: Literal["nb", "poisson"] = "nb",
+        deeply_inject_covariates: bool = True,
+        library_log_means: np.ndarray | None = None,
+        library_log_vars: np.ndarray | None = None,
+        use_observed_lib_size: bool = True,
+        use_size_factor: bool = False,
+        use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "none",
+        use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "both",
+        add_background: bool = False,
+        encode_covariates: bool = True,
+        size_scaling: bool = False,
+    ):
+        super().__init__()
+        # ==================== 1. 基础属性赋值 ====================
+        self.expression_anntorchdata = expression_anntorchdata
+        self.dispersion = dispersion
+        self.n_latent = n_latent
+        self.mixture_k = mixture_k
+        self.gene_likelihood = gene_likelihood
+        self.n_batch = n_batch
+        self.n_input = n_input
+        self.n_obs = n_obs
+        self.spatial_radius = spatial_radius
+        self.spatial_scale = spatial_scale
+        self.eps = torch.tensor(1e-6)
+        self.encode_covariates = encode_covariates
+        self.size_scaling = size_scaling
+        self.add_background = add_background # 存下来，留作后路
+        self.use_observed_lib_size = use_observed_lib_size
+
+        # ==================== 2. Library Size 经验先验 (极其重要，你忘了存它们) ====================
+        if library_log_means is None:
+            library_log_means = np.array([0.0])
+        if library_log_vars is None:
+            library_log_vars = np.array([1.0])
+        self.register_buffer("library_log_means", torch.from_numpy(library_log_means).float())
+        self.register_buffer("library_log_vars", torch.from_numpy(library_log_vars).float())
+
+        # ==================== 3. 各种 Buffer 注册 ====================
+        self.register_buffer("gene_dummy", torch.ones([max(1, n_batch), n_input])) # 加了个 max(1, n_batch) 防报错
+        
+        # 离散度 px_r
+        if self.dispersion == "gene":
+            init_px_r = torch.full([n_input], 0.01)
+        elif self.dispersion == "gene-batch":
+            init_px_r = torch.full([n_input, n_batch], 0.01)
+        else:
+            raise ValueError(f"dispersion must be one of ['gene', 'gene-batch'], but input was {self.dispersion}")
+        self.register_buffer("px_r", init_px_r)
+
+        # GMM 先验
+        self.register_buffer("u_prior_logits", torch.ones([mixture_k]))
+        self.register_buffer("u_prior_means", torch.randn([mixture_k, n_latent]))
+        self.register_buffer("u_prior_scales", torch.zeros([mixture_k, n_latent]) - 1.0)
+        
+        # 空间物理常量
+        self.register_buffer("spatial_scale", torch.tensor(spatial_scale))
+        self.register_buffer("spatial_radius", torch.tensor(spatial_radius))
+        
+        # 指数先验惩罚项 & a_n 先验方差
+        self.register_buffer("dispersion_penalty_R", torch.tensor(dispersion_penalty))
+        self.register_buffer("prior_a_scale_buffer", torch.tensor(prior_a_scale))
+        
+        # 背景预留占位符，是否加背景，以及如何计算背景，在预先训练的时候我们先不加背景，认为所有背景噪声都为0
+        if not add_background:
+            self.register_buffer("zero_bg_dummy", torch.zeros([1, n_input]))
+        #else:
+
+        # 全局细胞扩散偏置均值 mu_a (初始化为 -2.2)
+        self.mu_a = nn.Parameter(torch.tensor(-2.0))
+        
+        # 基因级别相对扩散偏置 b^g (初始化全为 0)
+        self.b_g_raw = nn.Parameter(torch.zeros(n_input))
+
+        cat_list = [n_batch] + list([] if n_cats_per_cov is None else n_cats_per_cov)
+
+        use_batch_norm_decoder = use_batch_norm == "decoder" or use_batch_norm == "both"
+        use_layer_norm_decoder = use_layer_norm == "decoder" or use_layer_norm == "both"
+
+        self.decoder = DecoderSCVI(
+            n_latent,
+            n_input,
+            n_cat_list=cat_list,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            inject_covariates=deeply_inject_covariates,
+            use_batch_norm=use_batch_norm_decoder,
+            use_layer_norm=use_layer_norm_decoder,
+        )
+    def _get_fn_args_from_batch(self, tensor_dict: dict[str, torch.Tensor]) -> Iterable | dict:
+        x = tensor_dict[REGISTRY_KEYS.X_KEY]
+        y = tensor_dict[REGISTRY_KEYS.LABELS_KEY].long().ravel()
+        batch_index = tensor_dict[REGISTRY_KEYS.BATCH_KEY]
+
+        cat_key = REGISTRY_KEYS.CAT_COVS_KEY
+        cat_covs = tensor_dict[cat_key] if cat_key in tensor_dict.keys() else None
+
+        ind_x = tensor_dict[REGISTRY_KEYS.INDICES_KEY].long().ravel()
+        distances_n = tensor_dict["distance_neighbor"]
+        ind_neighbors = tensor_dict["index_neighbor"].long()
+
+        x_n = self.expression_anntorchdata[ind_neighbors.cpu().numpy().flatten(), :]["X"]
+        if isinstance(x_n, np.ndarray):
+            x_n = torch.from_numpy(x_n)
+        x_n = x_n.to(x.device)
+
+        if x.layout is torch.sparse_csr or x.layout is torch.sparse_csc:
+            x = x.to_dense()
+        if x_n.layout is torch.sparse_csr or x_n.layout is torch.sparse_csc:
+            x_n = x_n.to_dense()
+        x_n = x_n.reshape(x.shape[0], -1)
+        library = torch.log(torch.sum(x, dim=1, keepdim=True))
+        size_factor = tensor_dict.get(REGISTRY_KEYS.SIZE_FACTOR_KEY, None)
+
+        return (), {
+            "x": x,
+            "ind_x": ind_x,
+            "library": library,
+            "y": y,
+            "batch_index": batch_index,
+            "cat_covs": cat_covs,
+            "x_n": x_n,
+            "distances_n": distances_n,
+            "size_factor": size_factor,
+        }
+    @auto_move_data
+    def model(
+        self,
+        x: torch.Tensor,
+        ind_x: torch.Tensor,
+        library: torch.Tensor,
+    ):
+    """Model structure""""
